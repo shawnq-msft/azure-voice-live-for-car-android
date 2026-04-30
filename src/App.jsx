@@ -10,6 +10,7 @@ import {
   Platform,
   NativeModules,
   NativeEventEmitter,
+  Switch,
   Alert,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -26,6 +27,21 @@ import Statistics from './components/Statistics';
 
 const { PcmPlayer, MicService } = NativeModules;
 
+const VAD_TYPES = [
+  { v: 'server_vad', label: 'Server VAD' },
+  { v: 'azure_semantic_vad', label: 'Azure Semantic' },
+  { v: 'azure_semantic_vad_multilingual', label: 'Azure Semantic (Multi)' },
+  { v: 'semantic_vad', label: 'Semantic (OpenAI)' },
+  { v: 'none', label: 'Off (manual)' },
+];
+
+const NOISE_REDUCTION_TYPES = [
+  { v: 'none', label: 'Off' },
+  { v: 'azure_deep_noise_suppression', label: 'Azure Deep' },
+  { v: 'near_field', label: 'Near field' },
+  { v: 'far_field', label: 'Far field' },
+];
+
 const DEFAULT_SESSION_CONFIG = {
   modalities: ['text', 'audio'],
   instructions:
@@ -38,6 +54,9 @@ const DEFAULT_SESSION_CONFIG = {
     threshold: 0.5,
     prefix_padding_ms: 300,
     silence_duration_ms: 500,
+    interrupt_response: true,
+    auto_truncate: false,
+    end_of_utterance_detection: { model: 'semantic_detection_v1' },
   },
   input_audio_echo_cancellation: { type: 'server_echo_cancellation' },
   input_audio_noise_reduction: { type: 'azure_deep_noise_suppression' },
@@ -290,8 +309,17 @@ export default function App() {
           addLog('✅ Session ready');
         }
         if (event.type === 'input_audio_buffer.speech_started') {
-          clearAudioQueue();
-          addLog('🎤 Speech started');
+          const allowInterrupt =
+            config.sessionConfig.turn_detection?.interrupt_response ?? true;
+          if (allowInterrupt) {
+            clearAudioQueue();
+            try {
+              clientRef.current?.send({ type: 'response.cancel' });
+            } catch (_) {}
+            addLog('🎤 Speech started — interrupting playback');
+          } else {
+            addLog('🎤 Speech started (no interrupt)');
+          }
         }
         if (event.type === 'input_audio_buffer.speech_stopped') {
           speechStartTimeRef.current = Date.now();
@@ -431,6 +459,26 @@ export default function App() {
   const updateSession = patch => {
     setConfig(c => ({ ...c, sessionConfig: { ...c.sessionConfig, ...patch } }));
   };
+
+  const updateTurnDetection = patch => {
+    setConfig(c => ({
+      ...c,
+      sessionConfig: {
+        ...c.sessionConfig,
+        turn_detection: { ...c.sessionConfig.turn_detection, ...patch },
+      },
+    }));
+  };
+
+  const td = config.sessionConfig.turn_detection || {};
+  const vadType = td.type || 'server_vad';
+  const isServerVad = vadType === 'server_vad';
+  const isOff = vadType === 'none';
+  const noiseType =
+    config.sessionConfig.input_audio_noise_reduction?.type || 'none';
+  const echoOn =
+    !!config.sessionConfig.input_audio_echo_cancellation &&
+    config.sessionConfig.input_audio_echo_cancellation.type !== 'none';
 
   const voices =
     config.modelCategory === 'LLM Realtime'
@@ -616,22 +664,159 @@ export default function App() {
                       multiline
                       style={[styles.input, { height: 70 }]}
                     />
-                    <Text style={styles.label}>
-                      VAD Threshold ({config.sessionConfig.turn_detection?.threshold ?? 0.5})
-                    </Text>
-                    <Slider
-                      value={config.sessionConfig.turn_detection?.threshold ?? 0.5}
-                      minimumValue={0}
-                      maximumValue={1}
-                      step={0.05}
+
+                    <Text style={styles.sectionLabel}>💬 Conversation</Text>
+
+                    <Text style={styles.label}>Turn Detection (VAD)</Text>
+                    <ChipSelect
+                      value={vadType}
+                      options={VAD_TYPES}
                       disabled={isConnected}
-                      minimumTrackTintColor="#2563eb"
-                      onValueChange={v =>
+                      onChange={t => {
+                        if (t === 'none') {
+                          updateSession({ turn_detection: { type: 'none' } });
+                        } else {
+                          updateTurnDetection({ type: t });
+                        }
+                      }}
+                    />
+
+                    {!isOff && (
+                      <>
+                        {isServerVad && (
+                          <>
+                            <Text style={styles.label}>
+                              VAD Threshold ({td.threshold ?? 0.5})
+                            </Text>
+                            <Slider
+                              value={td.threshold ?? 0.5}
+                              minimumValue={0}
+                              maximumValue={1}
+                              step={0.05}
+                              disabled={isConnected}
+                              minimumTrackTintColor="#2563eb"
+                              onValueChange={v =>
+                                updateTurnDetection({
+                                  threshold: Math.round(v * 100) / 100,
+                                })
+                              }
+                            />
+                          </>
+                        )}
+
+                        <Text style={styles.label}>
+                          Prefix Padding ({td.prefix_padding_ms ?? 300} ms)
+                        </Text>
+                        <Slider
+                          value={td.prefix_padding_ms ?? 300}
+                          minimumValue={0}
+                          maximumValue={1000}
+                          step={50}
+                          disabled={isConnected}
+                          minimumTrackTintColor="#2563eb"
+                          onValueChange={v =>
+                            updateTurnDetection({
+                              prefix_padding_ms: Math.round(v),
+                            })
+                          }
+                        />
+
+                        <Text style={styles.label}>
+                          Silence Duration ({td.silence_duration_ms ?? 500} ms)
+                        </Text>
+                        <Slider
+                          value={td.silence_duration_ms ?? 500}
+                          minimumValue={100}
+                          maximumValue={2000}
+                          step={50}
+                          disabled={isConnected}
+                          minimumTrackTintColor="#2563eb"
+                          onValueChange={v =>
+                            updateTurnDetection({
+                              silence_duration_ms: Math.round(v),
+                            })
+                          }
+                        />
+
+                        <View style={styles.toggleRow}>
+                          <Text style={styles.toggleLabel}>
+                            Interrupt (stop TTS on speech)
+                          </Text>
+                          <Switch
+                            disabled={isConnected}
+                            value={td.interrupt_response ?? true}
+                            onValueChange={v =>
+                              updateTurnDetection({ interrupt_response: v })
+                            }
+                            trackColor={{ false: '#4b5563', true: '#2563eb' }}
+                            thumbColor="#f3f4f6"
+                          />
+                        </View>
+
+                        <View style={styles.toggleRow}>
+                          <Text style={styles.toggleLabel}>
+                            Auto-truncate on barge-in
+                          </Text>
+                          <Switch
+                            disabled={isConnected}
+                            value={td.auto_truncate ?? false}
+                            onValueChange={v =>
+                              updateTurnDetection({ auto_truncate: v })
+                            }
+                            trackColor={{ false: '#4b5563', true: '#2563eb' }}
+                            thumbColor="#f3f4f6"
+                          />
+                        </View>
+
+                        <View style={styles.toggleRow}>
+                          <Text style={styles.toggleLabel}>
+                            End-of-utterance detection
+                          </Text>
+                          <Switch
+                            disabled={isConnected}
+                            value={!!td.end_of_utterance_detection}
+                            onValueChange={v =>
+                              updateTurnDetection({
+                                end_of_utterance_detection: v
+                                  ? { model: 'semantic_detection_v1' }
+                                  : null,
+                              })
+                            }
+                            trackColor={{ false: '#4b5563', true: '#2563eb' }}
+                            thumbColor="#f3f4f6"
+                          />
+                        </View>
+                      </>
+                    )}
+
+                    <Text style={styles.sectionLabel}>🎚 Audio Input</Text>
+
+                    <View style={styles.toggleRow}>
+                      <Text style={styles.toggleLabel}>Echo Cancellation</Text>
+                      <Switch
+                        disabled={isConnected}
+                        value={echoOn}
+                        onValueChange={v =>
+                          updateSession({
+                            input_audio_echo_cancellation: v
+                              ? { type: 'server_echo_cancellation' }
+                              : null,
+                          })
+                        }
+                        trackColor={{ false: '#4b5563', true: '#2563eb' }}
+                        thumbColor="#f3f4f6"
+                      />
+                    </View>
+
+                    <Text style={styles.label}>Noise Reduction</Text>
+                    <ChipSelect
+                      value={noiseType}
+                      options={NOISE_REDUCTION_TYPES}
+                      disabled={isConnected}
+                      onChange={t =>
                         updateSession({
-                          turn_detection: {
-                            ...config.sessionConfig.turn_detection,
-                            threshold: Math.round(v * 100) / 100,
-                          },
+                          input_audio_noise_reduction:
+                            t === 'none' ? null : { type: t },
                         })
                       }
                     />
@@ -889,6 +1074,23 @@ const styles = StyleSheet.create({
   chipTextSelected: { color: '#fff', fontWeight: '600' },
   advancedToggle: { paddingVertical: 6 },
   advancedText: { color: '#9ca3af', fontSize: 11, fontWeight: '600' },
+  sectionLabel: {
+    color: '#60a5fa',
+    fontSize: 11,
+    fontWeight: '700',
+    marginTop: 6,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  toggleRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    minHeight: 32,
+  },
+  toggleLabel: { color: '#d1d5db', fontSize: 12, flex: 1 },
   connectBtn: {
     flex: 1,
     paddingVertical: 10,

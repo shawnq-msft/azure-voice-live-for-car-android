@@ -67,15 +67,24 @@ export class RealtimeClient {
         ? { name: voiceValue, type: 'openai' }
         : { name: voiceValue, type: 'azure-standard' };
 
-      this.send({
-        type: 'session.update',
-        session: {
-          ...sessionConfig,
-          voice: formattedVoice,
-          input_audio_format: 'pcm16',
-          output_audio_format: 'pcm16',
-        },
+      const session = {
+        ...sessionConfig,
+        voice: formattedVoice,
+        input_audio_format: 'pcm16',
+        output_audio_format: 'pcm16',
+      };
+      Object.keys(session).forEach(k => {
+        if (session[k] === null || session[k] === undefined) delete session[k];
       });
+      if (session.turn_detection && typeof session.turn_detection === 'object') {
+        const td = { ...session.turn_detection };
+        Object.keys(td).forEach(k => {
+          if (td[k] === null || td[k] === undefined) delete td[k];
+        });
+        session.turn_detection = td;
+      }
+
+      this.send({ type: 'session.update', session });
     };
 
     this.ws.onmessage = e => {
